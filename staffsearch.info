@@ -1,0 +1,7 @@
+name = Staff Search
+description = Fuzzy search an LDAP schema
+core = 7.x
+package = BPL Utilities
+dependencies[] = ctools
+dependencies[] = ldap_servers
+files[] = staffsearch.module
