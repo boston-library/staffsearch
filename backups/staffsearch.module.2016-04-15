@@ -1,0 +1,696 @@
+<?php
+
+/**
+ * Staff Search - BPL Utilities
+ *
+ * Make a Drupal block that (fuzzy) searches an LDAP schema for staff names, email addresses, and phone numbers.
+ *
+ * @package	bpl_utilities
+ */
+
+/**
+ * Global variables
+ *
+ * @todo	Use this better
+ */
+date_default_timezone_set("UTC"); // Required if not set in php.ini
+
+/**
+ * Search LDAP and render the results
+ *
+ * This is the module's essential function. First it tokenizes the search term(s), then it runs an LDAP query on each
+ * token. If no results are found, it calculates Levenshtein distances and returns the five closest matches.
+ *
+ * @param	string		$filter_dept
+ * The department to search in
+ *
+ * @param	string		$query
+ * The query from the search box
+ *
+ * @return	array
+ * The search results in an HTML table
+ *
+ * @todo	Ignore whitespace in the LDAP filters
+ */
+function staffsearch_results_render_page($filter_dept, $query) {
+	$found_results = false;
+	$search_description = ($query === "Everyone" ? "<p>Showing all the results in " . $filter_dept . ".</p> " : "<p>Showing all the results for &ldquo;" . $query . "&rdquo; in " . $filter_dept . ".</p>");
+
+	$ldap_server = array_shift(ldap_servers_get_servers()); // Get the first connected and bound LDAP server
+	$results = array();
+	$table_entries = array();
+
+	$tokens = tokenize($query);
+	foreach ($tokens as $token) {
+		$filter_query = ($token === "Everyone" ? "*" : "*" . $token . "*");
+		$filter_dept = ($filter_dept === "All departments" ? "*" : $filter_dept);
+
+		// List the LDAP query elements
+		$query_attributes = array(
+			"cn",
+			"mail",
+			"telephonenumber",
+			"department",
+			"title",
+			"thumbnailphoto"
+		);
+
+		$ldapattribute_tableheaders = array(
+			"cn" => "Name",
+			"mail" => "Email",
+			"telephonenumber" => "Phone",
+			"title" => "Title",
+			"department" => "Department",
+			"thumbnailphoto" => "Picture"
+		);
+
+		// Make the LDAP query
+		$ldap_query = array(
+			"base_dn" => "dc=private,dc=bpl,dc=org",
+			"filter" => "(&(objectclass=user)(department=" . $filter_dept . ")(memberof=cn=Staff,ou=Distribution Lists,ou=Private Groups,dc=private,dc=bpl,dc=org)(|(cn=" . $filter_query . ")(mail=" . $filter_query . ")(telephonenumber=" . $filter_query . ")))",
+			"attributes" => $query_attributes,
+			"attrsonly" => 0
+		);
+
+		// Get the search results and insert them into a table
+		$results = $ldap_server -> search($ldap_query["base_dn"], $ldap_query["filter"], $ldap_query["attributes"], $ldap_query["attrsonly"]);
+		$table_entries = insert_ldap_records_into_table($results, $ldapattribute_tableheaders);
+		$found_results = ($results["count"] > 0 ? true : false);
+	}
+
+	/**
+	 * Levenshtein
+	 *
+	 * @link	https://secure.php.net/manual/en/function.levenshtein.php
+	 * The official documentation
+	 *
+	 * @link	https://secure.php.net/manual/en/function.levenshtein.php#51600
+	 * An helpful user comment 
+	 */
+	if ($found_results === false) {
+		$search_description = "<p>No results for &ldquo;" . $query . ".&rdquo; Here are the five best matches instead.</p>";
+
+		$lev_ordered = array();
+		$lev_results = array();
+		$draft_entries = array();
+
+		$words = memoize("get_users");
+		foreach ($words as $word) {
+			$query = strtolower($query); // PHP core's function is case sensitive
+			$word = strtolower($word);
+			$lev_ordered[$word] = levenshtein($query, $word);
+		}
+
+		$draft_filters = array_reverse(array_flip($lev_ordered));
+		$top_five = array_slice($draft_filters, 0, 5);
+		foreach ($top_five as $filter) {
+			$query_attributes = array(
+				"cn",
+				"mail",
+				"mailnickname",
+				"telephonenumber",
+				"department",
+				"title",
+				"thumbnailphoto"
+			);
+
+			// Make the LDAP query
+			$query = array(
+				"base_dn" => "dc=private,dc=bpl,dc=org",
+				"filter" => "(&(objectclass=user)(memberof=cn=Staff,ou=Distribution Lists,ou=Private Groups,dc=private,dc=bpl,dc=org)(mailnickname=" . $filter . "))",
+				"attributes" => $query_attributes,
+				"attrsonly" => 0
+			);
+
+			// Get the search results and put them in a table
+			$lev_results = $ldap_server -> search($query["base_dn"], $query["filter"], $query["attributes"], $query["attrsonly"]);
+			$draft_entry = insert_ldap_records_into_table($lev_results, $ldapattribute_tableheaders);
+			$draft_entries = array_merge($draft_entries, $draft_entry);
+			$found_results = ($lev_results["count"] > 0 ? true : false);
+		}
+		$table_entries = $draft_entries;
+	}
+
+	// Table headers for the results
+	$headers = array(
+		array(
+			"data" => t("Name"),
+			"field" => "Name",
+			"sort" => "desc"
+		),
+		array(
+			"data" => t("Email"),
+			"field" => "Email"
+		),
+		array(
+			"data" => t("Phone"),
+			"field" => "Phone"
+		),
+		array(
+			"data" => t("Department/Branch"),
+			"field" => "Department"
+		),
+		array(
+			"data" => t("Position"),
+			"field" => "Title"
+		),
+		 array(
+			"data" => t("Picture"),
+			"field" => "Picture"
+		)
+	);
+
+	$order = tablesort_get_order($headers); // From Drupal core
+	$sort = tablesort_get_sort($headers);
+	$table_entries = sort_results($table_entries, "Name", $sort);
+
+	// Table rows for the results
+	$rows = array();
+	foreach ($table_entries as $entry) {
+		$rows[] = array(
+			array("data" => $entry["Name"]),
+			array("data" => l($entry["Email"], "mailto:" . $entry["Email"], array("absolute" => true))),
+			array("data" => $entry["Phone"]),
+			array("data" => $entry["Department"]),
+			array("data" => $entry["Title"]),
+			array("data" => (isset($entry["Picture"]) ? data_uri($entry["Picture"], 75) : null))
+		);
+	}
+	$table = array(
+		"header" => $headers,
+		"rows" => $rows
+	);
+
+	$html_results = theme("table", $table);
+	$html_results = $search_description . $html_results;
+	return $html_results;
+}
+
+
+	/********************
+	 * Helper functions *
+	 ********************/
+
+/**
+ * Memoize
+ *
+ * Return the cached result of $function when the same inputs occur again.
+ *
+ * @param	callable	$function
+ * A function without side effects
+ *
+ * @return	array
+ * The cached function output
+ *
+ * @link	https://github.com/ihor/Nspl/blob/master/nspl/f.php
+ * Original source of the memoize function
+ */
+function memoize(callable $function) {
+	static $memory = array();
+
+	$args = func_get_args();
+	$key = serialize($args);
+	if (!isset($memory[$key]) && !array_key_exists($key, $memory)) {
+		$memory[$key] = call_user_func_array($function, $args);
+	}
+
+	return $memory[$key];
+}
+
+
+	/***********************
+	 * Display and handler *
+	 ***********************/
+
+/**
+ * Block view
+ *
+ * Spawn the search form in a floating element on page right. Don't rename the function!
+ *
+ * @param	string		$delta
+ * The block to work on
+ *
+ * @return	array
+ * The completed block
+ *
+ * @todo	Format the sidebar more naturally
+ */
+function staffsearch_block_view($delta) {
+	$block = array(
+		"subject" => t("Staff Directory"),
+		"content" => drupal_get_form("staffsearch_searchform")
+	);
+
+	/**
+	 * If your code sample is accurate, and you are calling drupal_add_js() from outside a function in a module
+	 * file, then that will be the problem.
+	 *
+	 * You would want to add your JS from within your hook_block_view(). This way it loads after Drupal has done
+	 * all it needs to do with its JS and jQuery will exist.
+	 *
+	 * @link	https://drupal.stackexchange.com/a/76565
+	 * Good Stack Overflow answer
+	 *
+	 * @todo	Find out why $block["#attached"] tries to pass the script in the URL
+	 */
+	drupal_add_js(instant_search(), array("type" => "inline", "scope" => "footer"));
+
+	if ($delta === "staff_search") {
+		//theme_get_suggestions(); // From Drupal core
+		return $block;
+	}
+}
+
+/**
+ * Menu
+ *
+ * Link the search form in the menu and create a menu entry for the results page. Don't rename the function!
+ *
+ * @return	array
+ * The search and results pages
+ */
+function staffsearch_menu() {
+	$items["staffsearch"] = array( // Search page
+		"title" => "Search Directory",
+		"page callback" => "drupal_get_form",
+		"page arguments" => array("staffsearch_searchform"),
+		"access callback" => "user_is_logged_in",
+		"type" => MENU_NORMAL_ITEM
+	);
+
+	$items["staffsearch/results/%/%"] = array( // Results page
+		"title" => "Directory Search",
+		"page callback" => "staffsearch_results_render_page",
+		"page arguments" => array(2, 3),
+		"access callback" => "user_is_logged_in",
+		"type" => MENU_CALLBACK
+	);
+
+	return $items;
+}
+
+/**
+ * Search form
+ *
+ * Make a form to display on its own page and in a block. Don't rename the function!
+ *
+ * @return	array
+ * The search form and its elements
+ *
+ * @link	http://regexr.com/
+ * Nice online regular expression tool
+ */
+function staffsearch_searchform() {
+	$form["search_box"] = array( // Text field for query string
+		"#type" => "textfield",
+		"#size" => 15,
+		"#maxlength" => 50,
+		"#title" => t("Name, email, or extension"),
+		"#attributes" => array(
+			"class" => "ui-autocomplete",
+			"id" => "search_box",
+			"pattern" => "[0-9A-Za-z '()\*,\-\.@]+",
+			"placeholder" => "Find colleagues",
+			"title" => "Accepts alphanumerics, space, apostrophe, parentheses, asterisk, comma, hyphen, period, and the at sign"
+		)
+	);
+
+	$form["dept_select"] = array( // Dropdown select for departments
+		"#type" => "select",
+		"#title" => t("Department or branch"),
+		"#options" => memoize("get_departments")
+	);
+
+	$form["fuzzy"] = array( // Checkbox for fuzzy search
+		"#type" => "checkbox",
+		"#name" => "fuzzy",
+		"#title" => t("Fuzzy search"),
+		"#value" => false
+	);
+
+	$form["submit"] = array( // Submit button
+		"#type" => "submit",
+		"#value" => "Search"
+	);
+
+	return $form;
+}
+
+/**
+ * Submit search form
+ *
+ * Test for null queries and format the results URL accordingly. Don't rename the function!
+ *
+ * @param	array		$form
+ * The empty form to submit
+ *
+ * @param	array		$form_state
+ * The submitted form with user input
+ *
+ * @todo	Escape slashes in the results URL
+ */
+function staffsearch_searchform_submit($form, &$form_state) {
+	$null_query = ($form_state["values"]["search_box"] == null ? true : false); // Strict equality fails
+	if ($null_query) {
+		$form_state["values"]["search_box"] = "Everyone";
+	}
+
+	$fuzzy_finder = $_POST["fuzzy"]; // Strict equality and $form_state fail
+	if (isset($fuzzy_finder) && $fuzzy_finder !== false) {
+		$not_fuzzy = str_split($form_state["values"]["search_box"]);
+		$yes_fuzzy = implode("*", $not_fuzzy);
+		$name = ($yes_fuzzy === "E*v*e*r*y*o*n*e" ? "Everyone" : $yes_fuzzy); // Blank fuzzy fail-safe
+	} else {
+		$name = $form_state["values"]["search_box"];
+	}
+
+	$dept = $form_state["values"]["dept_select"];
+	$form_state["redirect"] = "staffsearch/results/" . $dept . "/" . $name;
+}
+
+
+	/********************
+	 * LDAP server data *
+	 ********************/
+
+/**
+ * Get departments
+ *
+ * Enumerate the departments to make a dropdown menu with "All departments" selected by default.
+ *
+ * @return	array
+ * Alphabetical list of departments
+ */
+function get_departments() {
+	// Get the LDAP server instance(s)
+	$sid = "";
+	$ldap_instances = ldap_servers_get_servers(); // From the LDAP module
+	foreach ($ldap_instances as $instance) {
+		$sid = $instance -> sid;
+	}
+
+	// Make an LDAP query only for departments
+	$ldq = array(
+		"base_dn" => "ou=VOIP Pilot,dc=private,dc=bpl,dc=org", // VOIP Pilot filters non-BPL people; 1337 h4xx
+		"filter" => "(department=*)",
+		"attributes" => array("department"),
+		"attrsonly" => 0
+	);
+
+	// Connect, search, and get the results
+	$ldap_server = new LdapServer($sid);
+	$results_dept = $ldap_server -> search($ldq["base_dn"], $ldq["filter"], $ldq["attributes"], $ldq["attrsonly"]);
+
+	// Loop through the department names
+	$dept_names;
+	for ($d = 0; $d < $results_dept["count"]; $d++) {
+		if (isset($results_dept[$d]["department"])) {
+			$dept_keys = $results_dept[$d]["department"][0];
+			$dept_names[$dept_keys] = $dept_keys;
+		}
+	}
+
+	$default_option = array("All departments" => "All departments");
+	$dept_select = array_unique($dept_names);
+	asort($dept_select);
+
+	$result = array_merge($default_option, $dept_select);
+	return $result;
+}
+
+/**
+ * Get users
+ *
+ * Enumerate the users to make an array of possible Levenshtein values.
+ *
+ * @return	array
+ * Alphabetical list of users
+ */
+function get_users() {
+	// Get the LDAP server instance(s)
+	$sid = "";
+	$ldap_instances = ldap_servers_get_servers();
+	foreach ($ldap_instances as $instance) {
+		$sid = $instance -> sid;
+	}
+
+	// Make an LDAP query only for users
+	$ldq = array(
+		"base_dn" => "dc=private,dc=bpl,dc=org",
+		"filter" => "(&(objectclass=user)(mailnickname=*)(memberof=cn=Staff,ou=Distribution Lists,ou=Private Groups,dc=private,dc=bpl,dc=org))",
+		"attributes" => array("mailnickname"),
+		"attrsonly" => 0
+	);
+
+	// Connect, search, and get the results
+	$ldap_server = new LdapServer($sid);
+	$results_user = $ldap_server -> search($ldq["base_dn"], $ldq["filter"], $ldq["attributes"], $ldq["attrsonly"]);
+
+	// Loop through the user names
+	$user_names;
+	for ($u = 0; $u < $results_user["count"]; $u++) {
+		$user_keys = $results_user[$u]["mailnickname"][0];
+		$user_names[$user_keys] = $user_keys;
+	}
+
+	$user_select = array_unique($user_names);
+	asort($user_select);
+
+	$result = array_merge($user_select);
+	return $result;
+}
+
+/**
+ * Insert LDAP records into table
+ *
+ * Iterate through the records found by the LDAP query and add them to an array. The array helps make an HTML table.
+ *
+ * @param	array		$foundRecords
+ * Unformatted LDAP entries returned from the query
+ *
+ * @param	array		$attributesToDisplay
+ * Attributes to display from the the entries
+ *
+ * @return	array
+ * LDAP records containing information from $foundRecords
+ */
+function insert_ldap_records_into_table($foundRecords = null, $attributesToDisplay = array()) {
+	$table_entries = array();
+
+	$numberOfRecordsFound = $foundRecords["count"];
+	for ($i = 0; $i < $numberOfRecordsFound; $i++) {
+		foreach ($attributesToDisplay as $attr => $columnName) {
+			$table_entries[$i][$columnName] = $foundRecords[$i][$attr][0];
+		}
+	}
+
+	return $table_entries;
+}
+
+
+	/*************************
+	 * String transformation *
+	 *************************/
+
+/**
+ * Sort results
+ *
+ * Sort the search results by any category. The default order is name, ascending.
+ *
+ * @param	string		$order
+ * Name or email
+ *
+ * @param	string		$sort
+ * Ascending or descending
+ *
+ * @return	array
+ * Sort search results and populate the results table with them
+ */
+function sort_results(&$table_entries, $order, $sort) {
+	$case = array($order, $sort);
+	switch ($case) {
+	case array("Name", "asc"):
+		usort($table_entries, "reverse_names");
+		break;
+	case array("Name", "desc"):
+		usort($table_entries, "compare_names");
+		break;
+	case array("Email", "asc"):
+		usort($table_entries, "reverse_emails");
+		break;
+	case array("Email", "desc"):
+		usort($table_entries, "compare_emails");
+		break;
+	//default:
+		//break;
+	}
+
+	return $table_entries;
+}
+
+/**
+ * Compare and reverse names and emails
+ */
+function compare_names($a, $z) {
+	return strcmp($a["Name"], $z["Name"]);
+}
+
+function reverse_names($a, $z) {
+	return strcmp($z["Name"], $a["Name"]);
+}
+
+function compare_emails($a, $z) {
+	return strcmp($a["Email"], $z["Email"]);
+}
+
+function reverse_emails($a, $z) {
+	return strcmp($z["Email"], $a["Email"]);
+}
+
+/**
+ * Tokenize
+ *
+ * Break on whitespace and punctuation. Don't include whitespace in tokens. Every punctuation character is a single
+ * token. The regular expression matches four patterns in order.
+ *
+ * 1. Any separator or other in sequence
+ * 2. A sequence of characters that are not punctuation, separator, or other
+ * 3. Punctuations, one by one
+ * 4. A sequence of separators that follows
+ *
+ * @param	string		$str
+ * A multi-word string
+ *
+ * @return	array
+ * An array of tokens
+ *
+ * @link	https://github.com/angeloskath/php-nlp-tools/blob/master/src/NlpTools/Tokenizers/WhitespaceAndPunctuationTokenizer.php
+ * Original source of the tokenize function
+ *
+ * @link	http://php-nlp-tools.com/documentation/api/NlpTools/Tokenizers/WhitespaceAndPunctuationTokenizer.html
+ * NlpTools library documentation
+ */
+function tokenize($str) {
+	$arr = array();
+
+	$pat = "/([\pZ\pC]*)([^\pP\pZ\pC]+ |.)([\pZ\pC]*)/xu";
+	preg_match_all($pat, $str, $arr);
+
+	return $arr[2];
+}
+
+/**
+ * Leventhal
+ *
+ * Calculate Levenshtein distances as a value between 0 and 1. Consider not only the required letter substitutions,
+ * but also the common letters.
+ *
+ * @param	string		$str_a
+ * The string you want to find, or $needle
+ *
+ * @param	string		$str_b
+ * The string you need to search, or $haystack
+ *
+ * @return	float
+ * The Levenshtein distance; higher is closer
+ *
+ * @example	documentation/examples/leventhal.php
+ * The PHP core function returns the same Levenshtein distance even though "x" isn't in the first string
+ *
+ * @link	https://cambiatablog.wordpress.com/2011/03/25/algorithm-for-string-similarity-better-than-levenshtein-and-similar_text/
+ * Original source of the improved Levenshtein function
+ *
+ * @todo	Memoize the output
+ * @todo	Update PHP
+ */
+function leventhal($str_a, $str_b) {
+	$i = 0;
+	$length = strlen($str_a);
+	$length_b = strlen($str_b);
+
+	$segment = "";
+	$segmentcount = 0;
+	$segmentsinfo = array();
+
+	while ($i < $length) {
+		$char = substr($str_a, $i, 1);
+		if (strpos($str_b, $char) !== false) {
+			$segment = $segment . $char;
+			if (strpos($str_b, $segment) !== false) {
+				$segmentpos_a = $i - strlen($segment) + 1;
+				$segmentpos_b = strpos($str_b, $segment);
+				$positiondiff = abs($segmentpos_a - $segmentpos_b);
+				$posfactor = ($length - $positiondiff) / $length_b; // ?
+				$lengthfactor = strlen($segment) / $length;
+				$segmentsinfo[$segmentcount] = array("segment" => $segment, "score" => ($posfactor * $lengthfactor));
+			} else {
+				 $segment = "";
+				 $i--;
+				 $segmentcount++;
+			}
+		} else {
+			$segment = "";
+			$segmentcount++;
+		}
+		$i++;
+	}
+
+	// PHP 5.3 lambda in array_map
+	//$totalscore = array_sum(array_map(function($v) { return $v["score"]; }, $segmentsinfo));
+	//return $totalscore;
+}
+
+
+	/**************************
+	 * Picture transformation *
+	 **************************/
+
+/**
+ * Data URI
+ *
+ * Take binary data and return an HTML image in Base64 encoding.
+ *
+ * @param	string		$binary
+ * A binary file or data stream
+ *
+ * @param	int		$width
+ * The width in pixels
+ *
+ * @return	string
+ * A data URI in an HTML image
+ */
+function data_uri($binary, $width) {
+	$base64 = base64_encode($binary);
+	$mime = mime_content_type($binary);
+	$data_uri = "data:" . $mime . ";base64," . $base64;
+
+	return "<img src=\"" . $data_uri . "\" alt=\"\" width=\"" . $width . "px\" />";
+}
+
+
+	/**************
+	 * JavaScript *
+	 **************/
+
+function instant_search() {
+	$draft_tags = memoize("get_users");
+	$tags = "[" . "\"" . implode("\",\"", $draft_tags) . "\"" . "]";
+
+	$script = <<<EOT
+	(function($) {
+		"use strict";
+		$(document).ready(function(){
+			var tags = $tags;
+			$("#search_box").autocomplete({
+				delay: 200,
+				minLength: 4,
+				source: tags
+			});
+		});
+	}(jQuery));
+EOT;
+
+	return $script;
+}
+
+?>
